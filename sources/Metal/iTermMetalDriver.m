@@ -2,6 +2,7 @@
 @import MetalKit;
 
 #import "iTermMetalDriver.h"
+#include <time.h>
 
 #import "DebugLogging.h"
 #import "FutureMethods.h"
@@ -2169,6 +2170,95 @@ extraIdentifyingInfoForIcon:button.extraIdentifyingInfoForIcon];
     return shouldCopyToDrawable;
 }
 
+#pragma mark - MAGPIE frame capture
+
+// MAGPIE frame capture (for recording PR videos): when ITERM_MAGPIE_FRAME_DIR
+// names a directory, every frame drawn while <dir>/recording exists is copied
+// to <dir>/clip_NN/f_NNNNNN.rgba (BGRA, top-down rows), with
+// "NNNNNN <CLOCK_MONOTONIC seconds>" lines in times.txt and "width height" in
+// size.txt. Each time recording starts a new clip directory is used.
+static NSString *iTermMagpieCaptureDir(void) {
+    static NSString *dir;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *env = getenv("ITERM_MAGPIE_FRAME_DIR");
+        if (env && env[0]) {
+            dir = [NSString stringWithUTF8String:env];
+        }
+    });
+    return dir;
+}
+
+static void iTermMagpieCaptureFrame(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> texture) {
+    NSString *dir = iTermMagpieCaptureDir();
+    if (!dir || !texture) {
+        return;
+    }
+    static int clip;
+    static unsigned frame;
+    static BOOL recording;
+    static dispatch_queue_t writeQueue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        writeQueue = dispatch_queue_create("com.magpie.frame-capture", DISPATCH_QUEUE_SERIAL);
+    });
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:[dir stringByAppendingPathComponent:@"recording"]]) {
+        recording = NO;
+        return;
+    }
+    if (texture.pixelFormat != MTLPixelFormatBGRA8Unorm && texture.pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB) {
+        static dispatch_once_t warnToken;
+        dispatch_once(&warnToken, ^{
+            NSLog(@"MAGPIE capture: unsupported pixel format %@", @(texture.pixelFormat));
+        });
+        return;
+    }
+    if (!recording) {
+        recording = YES;
+        clip++;
+        frame = 0;
+        NSString *clipDir = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"clip_%02d", clip]];
+        [fm createDirectoryAtPath:clipDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    const NSUInteger width = texture.width;
+    const NSUInteger height = texture.height;
+    const NSUInteger bytesPerRow = width * 4;
+    id<MTLBuffer> buffer = [commandBuffer.device newBufferWithLength:bytesPerRow * height
+                                                             options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    [blit copyFromTexture:texture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(width, height, 1)
+                 toBuffer:buffer
+        destinationOffset:0
+   destinationBytesPerRow:bytesPerRow
+ destinationBytesPerImage:bytesPerRow * height];
+    [blit endEncoding];
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double when = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    const unsigned n = frame++;
+    NSString *clipDir = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"clip_%02d", clip]];
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull buf) {
+        dispatch_async(writeQueue, ^{
+            NSData *data = [NSData dataWithBytesNoCopy:buffer.contents length:bytesPerRow * height freeWhenDone:NO];
+            [data writeToFile:[clipDir stringByAppendingPathComponent:[NSString stringWithFormat:@"f_%06u.rgba", n]] atomically:NO];
+            [[NSString stringWithFormat:@"%lu %lu bgra\n", (unsigned long)width, (unsigned long)height]
+                writeToFile:[clipDir stringByAppendingPathComponent:@"size.txt"] atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            NSString *timesPath = [clipDir stringByAppendingPathComponent:@"times.txt"];
+            FILE *times = fopen(timesPath.fileSystemRepresentation, "a");
+            if (times) {
+                fprintf(times, "%06u %.6f\n", n, when);
+                fclose(times);
+            }
+            [buffer class];  // keep the buffer alive until written
+        });
+    }];
+}
+
 - (void)finishDrawingWithCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
                              frameData:(iTermMetalFrameData *)frameData {
     DLog(@"Finish drawing frameData %@", frameData);
@@ -2210,6 +2300,9 @@ extraIdentifyingInfoForIcon:button.extraIdentifyingInfoForIcon];
         DLog(@"  Copy offscreen texture to drawable %@", frameData);
         [self copyOffscreenTextureToDrawableInFrameData:frameData];
     }
+    iTermMagpieCaptureFrame(commandBuffer,
+                            shouldCopyToDrawable ? frameData.temporaryRenderPassDescriptor.colorAttachments[0].texture
+                                                 : frameData.destinationTexture);
     [frameData measureTimeForStat:iTermMetalFrameDataStatPqEnqueueDrawPresentAndCommit ofBlock:^{
 #if !ENABLE_SYNCHRONOUS_PRESENTATION
         if (frameData.destinationDrawable) {
